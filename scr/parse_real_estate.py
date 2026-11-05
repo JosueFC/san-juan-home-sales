@@ -1,8 +1,8 @@
-"""Parse manually copied Tasamax pages into privacy-conscious CSV rows (v2).
+"""Parse manually copied Tasamax pages into privacy-conscious CSV rows.
 
-Usage: python parse_real_estate_v2.py input.txt -o properties.csv
+Usage: python parse_real_estate.py input.txt -o properties.csv
 
-Changes vs v1 (all verified against 200 real records):
+Changes vs the first version (verified against sample records):
 - Description line is no longer skipped; amenities come from the structured
   "Property Facilities / Terrace / Security ..." sections AND the description.
 - Captures Sales Type, catastro, tax code, street, unit, zoning, appraisal date,
@@ -147,16 +147,21 @@ def parse(text, source_file=''):
         row['complex_facilities'] = '; '.join(sections.get('Complex Facilities', []))
         row['extra_parkings'] = '; '.join(sections.get('Extra Parkings', []))
 
-        # days on market
+        # days on market (free text: "45 days", "3 days, original asking price $535,000.",
+        # "The buyer is the tenant.", "The subject was never exposed to the open market.", ...)
         dom = row.pop('dom_raw', '')
         d = re.match(r'^\s*(\d+)\b', dom)
         row['days_on_market'] = int(d.group(1)) if d else None
         a = re.search(r'original asking price\s*\$?\s*([\d,]+)', dom, re.I)
         row['original_asking_price'] = float(a.group(1).replace(',', '')) if a else None
-        row['related_party_sale'] = int(bool(re.search(r'family|friend|neighbor|relative|related', dom, re.I)))
-        row['was_listed'] = 0 if re.search(r'not listed', dom, re.I) else (1 if d else '')
-        if (dom and not d and not a and not row['related_party_sale']
-                and not re.match(r'unknown|the property was not listed', dom, re.I)):
+        related = re.search(r'famil|friend|neighbor|relative|related|acquaint|'
+                            r'\b(?:son|daughter|brother|sister|mother|father|spouse|wife|husband|parents?)\b', dom, re.I)
+        row['related_party_sale'] = int(bool(related))
+        row['buyer_is_tenant'] = int(bool(re.search(r'tenant', dom, re.I)))
+        not_listed = re.search(r'\b(?:not|never)\s+(?:been\s+|in\s+)?(?:listed|exposed|offered|(?:the\s+)?open\s+market)', dom, re.I)
+        row['was_listed'] = 0 if not_listed else (1 if d else '')
+        if dom and not (d or a or related or row['buyer_is_tenant'] or not_listed
+                        or re.match(r'unknown|vacant', dom, re.I)):
             flags.append('dom_unrecognized')
 
         # condition / quality
@@ -168,19 +173,30 @@ def parse(text, source_file=''):
         if row.get('contract_price') is not None and not (c or q):
             flags.append('no_condition_code')
 
-        # garage: "One Car Carport", "Double Garage", "2 Cars Garage/2 Cars Dwy", "1 Car Cpt/1 Car Dwy", "None"
+        # garage: "One Car Carport", "Double Garage", "2 Cars Garage/2 Cars Dwy", "1 Car Cpt/1 Car Dwy",
+        # "Two Carports", "Two Parkings", "Carport", "None"
         g = row.pop('garage_raw', '')
         row['garage_cars'] = row['carport_cars'] = row['driveway_cars'] = (None if not g else 0)
         for part in g.split('/'):
-            mm = re.match(r'\s*(\d+|one|two|three|four|five|six|double|single)\b', part, re.I)
-            if not mm:
+            part = part.strip()
+            kind = ('garage' if re.search(r'garage', part, re.I)
+                    else 'carport' if re.search(r'carport|cpt', part, re.I)
+                    else 'driveway' if re.search(r'driveway|dwy|parking', part, re.I) else None)
+            if not kind:
+                if part and not re.match(r'none$', part, re.I):
+                    flags.append('garage_unrecognized')
                 continue
-            w = mm.group(1).lower()
-            num = int(w) if w.isdigit() else WORDNUM[w]
-            if re.search(r'garage', part, re.I): row['garage_cars'] = num
-            elif re.search(r'carport|cpt', part, re.I): row['carport_cars'] = num
-            elif re.search(r'driveway|dwy', part, re.I): row['driveway_cars'] = num
-            else: flags.append('garage_unrecognized')
+            mm = re.match(r'(\d+|one|two|three|four|five|six|double|single)\b', part, re.I)
+            if mm:
+                w = mm.group(1).lower()
+                num = int(w) if w.isdigit() else WORDNUM[w]
+                if re.match(r'\w+\s+double\b', part, re.I):      # "Two Double Garages"
+                    num *= 2
+            else:                                                 # bare "Carport", "Extended Carport"
+                num = 1
+                flags.append('garage_count_assumed')
+            row[{'garage': 'garage_cars', 'carport': 'carport_cars', 'driveway': 'driveway_cars'}[kind]] = num
+        row['covered_parking_cars'] = (row['garage_cars'] or 0) + (row['carport_cars'] or 0) if g else None
 
         # HOA
         h = row.pop('hoa_raw', '')
@@ -230,6 +246,7 @@ def parse(text, source_file=''):
             flags.append('registry_source')
         if row['sales_type'] and row['arms_length'] == 0: flags.append('non_arms_length')
         if row['related_party_sale']: flags.append('related_party')
+        if row['buyer_is_tenant']: flags.append('buyer_is_tenant')
         if (row.get('tax_code') and row.get('catastro')
                 and not re.sub(r'\D', '', row['tax_code']).startswith(re.sub(r'\D', '', row['catastro']))):
             flags.append('tax_catastro_mismatch')
