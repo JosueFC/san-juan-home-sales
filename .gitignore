@@ -1,2 +1,9 @@
-*.txt*.csv
+﻿# Raw pages and generated data (contain addresses and personal details)
+*.txt
+*.csv
+*.db
 data/
+
+# Python
+__pycache__/
+*.pyc
