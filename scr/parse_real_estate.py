@@ -141,8 +141,11 @@ def parse(text, source_file=''):
         # sections
         st = ' '.join(sections.get('Sales Type', []))
         row['sales_type'] = st
-        row['arms_length'] = (1 if re.search(r'arms?\s*length', st, re.I) and not re.search(r'non', st, re.I)
+        # Arms-length only if the sales type says so and nothing else ("Arms Length Sale Estate Sale" is mixed).
+        row['arms_length'] = (1 if re.search(r'arms?\s*length', st, re.I) and not re.search(r'non|estate|reo|short', st, re.I)
                               else 0 if st else '')
+        if re.search(r'arms?\s*length', st, re.I) and re.search(r'estate|reo|short', st, re.I):
+            flags.append('mixed_sales_type')
         row['security_features'] = '; '.join(sections.get('Security', []))
         row['complex_facilities'] = '; '.join(sections.get('Complex Facilities', []))
         row['extra_parkings'] = '; '.join(sections.get('Extra Parkings', []))
