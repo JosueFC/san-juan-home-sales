@@ -87,7 +87,9 @@ def norm(s):
     return re.sub(r'[^a-z0-9]+', ' ', (s or '').lower()).strip()
 
 
-def parse(text, source_file=''):
+def parse(text, source_file='', overrides=None):
+    """overrides: {property_id: {field: value}} manual corrections for numeric and price fields,
+    e.g. a mistyped living area (gla_sqft) or a bad header value (appraisal_value)."""
     lines = text.splitlines()
     heads = [(i, HEADER.match(l)) for i, l in enumerate(lines) if HEADER.match(l)]
     for n, (idx, m) in enumerate(heads):
@@ -130,13 +132,27 @@ def parse(text, source_file=''):
                     row[k] = float(row[k].replace(',', ''))
                 except ValueError:
                     row[k] = None
+        for field, value in (overrides or {}).get(row['property_id'], {}).items():
+            if field in NUMBERS:
+                row[field] = value
+                flags.append(f'manual_override_{field}')
         for k in MONEY_FIELDS:
             row[k] = money(row.get(k))
+        for field, value in (overrides or {}).get(row['property_id'], {}).items():
+            if field in MONEY_FIELDS or field in ('sales_price', 'appraisal_value'):
+                row[field] = value
+                flags.append(f'manual_override_{field}')
         for k in DATE_FIELDS:
             raw = row.get(k, '')
             row[k] = to_iso(raw)
             if raw and not row[k]:
                 flags.append(f'bad_{k}')
+
+        # Tax code is stored without dashes and sometimes loses its leading zero ("3908530107001" for
+        # catastro 039-085-301-07). Normalize to 14 digits so it can be compared with, and joined to, the catastro.
+        tc = re.sub(r'\D', '', row.get('tax_code', ''))
+        if tc:
+            row['tax_code'] = tc.zfill(14)
 
         # sections
         st = ' '.join(sections.get('Sales Type', []))
@@ -153,7 +169,7 @@ def parse(text, source_file=''):
         # days on market (free text: "45 days", "3 days, original asking price $535,000.",
         # "The buyer is the tenant.", "The subject was never exposed to the open market.", ...)
         dom = row.pop('dom_raw', '')
-        d = re.match(r'^\s*(\d+)\b', dom)
+        d = re.match(r'^\s*(\d+)', dom)          # tolerates source typos such as "90d ays" or "2days"
         row['days_on_market'] = int(d.group(1)) if d else None
         a = re.search(r'original asking price\s*\$?\s*([\d,]+)', dom, re.I)
         row['original_asking_price'] = float(a.group(1).replace(',', '')) if a else None
@@ -234,6 +250,19 @@ def parse(text, source_file=''):
         row['contract_minus_sales_price'] = round(cp - sp, 2) if cp is not None and sp is not None else None
         row['contract_matches_sales_price'] = (int(abs(cp - sp) < 1) if cp is not None and sp is not None else '')
         row['sales_to_appraisal_ratio'] = round(sp / av, 3) if sp and av else None
+        # Renegotiation signals: the contract price is the original agreement; when the appraisal comes in low,
+        # the deal is often cut to the appraised value, so sales_price == appraisal_value.
+        row['sold_at_appraisal'] = int(abs(sp - av) < 1) if sp and av else ''
+        row['price_change_from_contract_pct'] = round((sp - cp) / cp * 100, 1) if sp and cp else None
+        # A sale more than 40% above the appraisal is almost always a bad value in the list header, for example a
+        # repair total ($16,000) shown instead of the value (the appraisal said as-is $144,000, as-repaired $160,000).
+        # Blank it so it cannot distort appraisal-gap statistics; the original is kept in appraisal_value_raw.
+        if row['sales_to_appraisal_ratio'] and row['sales_to_appraisal_ratio'] > 1.4:
+            flags.append('appraisal_value_suspect')
+            row['appraisal_value_raw'] = av
+            row['appraisal_value'] = None
+            row['sales_to_appraisal_ratio'] = None
+            row['sold_at_appraisal'] = ''
 
         # checks
         rd, cd = row['settled_sale_date'], row['contract_date']
@@ -244,6 +273,10 @@ def parse(text, source_file=''):
         if 'karibe' in desc.lower(): flags.append('registry_derived_data')
         if sp is not None and not row['sales_type']: flags.append('no_sales_type')
         if not gla: flags.append('no_gla')
+        elif gla < 300 or (row.get('bedrooms') and gla / row['bedrooms'] < 150):
+            flags.append('gla_suspect')          # e.g. 220 sq ft with 4 bedrooms: a lost digit
+        elif gla > 6000:
+            flags.append('gla_very_large')
         if cp is None: flags.append('no_contract_price')
         if row.get('source', '').lower().startswith('registry') or 'registr' in row.get('source', '').lower():
             flags.append('registry_source')
@@ -256,8 +289,18 @@ def parse(text, source_file=''):
         if sp and gla and not (30 <= sp / gla <= 1500): flags.append('price_per_sqft_outlier')
         if sp is not None and sp < 20000: flags.append('very_low_price')
         if row['contract_matches_sales_price'] == 0:
-            flags.append('contract_price_differs_from_sales_price')
-            if not (0.5 <= cp / sp <= 2): flags.append('contract_price_suspect')
+            # A gap is normal when the deal was renegotiated down to the appraised value (sold_at_appraisal).
+            if abs(cp - sp) / sp >= 0.10 and not row['sold_at_appraisal']:
+                flags.append('contract_gap_unexplained')
+            if not (0.5 <= cp / sp <= 2):
+                # Almost always a typo (a dropped or extra zero). The settled sales price is unaffected, so keep the
+                # row but blank the contract-based fields so they cannot distort price-change statistics.
+                flags.append('contract_price_suspect')
+                row['contract_price_raw'] = cp
+                row['contract_price'] = None
+                row['contract_minus_sales_price'] = None
+                row['contract_matches_sales_price'] = ''
+                row['price_change_from_contract_pct'] = None
         if row['sales_to_appraisal_ratio'] and not (0.75 <= row['sales_to_appraisal_ratio'] <= 1.25):
             flags.append('sales_price_far_from_appraisal')
         if '?' in (row['neighborhood'] + row.get('street', '')): flags.append('encoding_loss')

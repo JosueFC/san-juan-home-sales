@@ -34,11 +34,26 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
+def load_overrides(path):
+    """{property_id: {field: float}} from a CSV with columns property_id, field, value. Optional file."""
+    result = {}
+    if path.exists():
+        with path.open(encoding='utf-8-sig', newline='') as handle:
+            for row in csv.DictReader(handle):
+                if row.get('property_id') and row.get('field') and row.get('value', '').strip():
+                    result.setdefault(row['property_id'].strip(), {})[row['field'].strip()] = float(row['value'].replace(',', ''))
+        print(f'Loaded {sum(len(v) for v in result.values())} manual overrides from {path}')
+    return result
+
+
 def main():
     ap = argparse.ArgumentParser(description='Parse and combine all property .txt pages')
     ap.add_argument('--input-dir', type=Path, default=Path('data/raw'))
     ap.add_argument('--output', type=Path, default=Path('data/processed/properties.csv'))
+    ap.add_argument('--overrides', type=Path, default=Path('data/overrides.csv'),
+                    help='optional CSV with columns property_id,field,value for manual corrections (e.g. gla_sqft)')
     args = ap.parse_args()
+    overrides = load_overrides(args.overrides)
 
     if not args.input_dir.is_dir():
         ap.error(f'Input folder does not exist: {args.input_dir}')
@@ -50,7 +65,7 @@ def main():
     failed_files = bad_rows = 0
     for file in files:
         try:
-            parsed = list(parse(file.read_text(encoding='utf-8-sig'), file.name))
+            parsed = list(parse(file.read_text(encoding='utf-8-sig'), file.name, overrides))
             if not parsed:
                 empty_files.append(file.name)
             rows.extend(parsed)
